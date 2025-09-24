@@ -1,25 +1,39 @@
 import pandas as pd
+import pyarrow.parquet as pq
+import numpy as np
+from typing import Optional
+import os
+import psutil
+import time
 
-class PriceConverter():
-    def __init__(self, ccy_df, price_df, spot_rate_df):
-        self.ccy_df = ccy_df.copy() 
-        self.price_df = price_df.copy()
-        self.spot_rate_df = spot_rate_df.copy()
-        # Ensure datetime columns
+
+class PriceConverter:
+    """Handles price conversion logic including data loading, spot merging, validation, and export."""
+
+    def __init__(self, price_path: str, spot_path: str, ccy_path: str):
+        """Initializes and loads all input files from provided paths."""
+        self.ccy_df = pd.read_csv(ccy_path)
+        self.price_df = pq.read_table(price_path).to_pandas()
+        self.spot_rate_df = pq.read_table(spot_path).to_pandas()
+
+        # Standardize and convert timestamps
         self.price_df['timestamp'] = pd.to_datetime(self.price_df['timestamp'])
         self.spot_rate_df['timestamp'] = pd.to_datetime(self.spot_rate_df['timestamp'])
         self.price_df = self.price_df.rename(columns={'timestamp': 'price_timestamp'})
         self.spot_rate_df = self.spot_rate_df.rename(columns={'timestamp': 'spot_timestamp'})
 
-    def _merge_conversion_factors(self):
+        self.result_df: Optional[pd.DataFrame] = None
+
+    def _merge_conversion_factors(self) -> pd.DataFrame:
+        """Joins price_df with ccy_df to bring in conversion metadata."""
         return self.price_df.merge(
             self.ccy_df[['ccy_pair', 'convert_price', 'conversion_factor']],
             on='ccy_pair',
             how='left'
         )
     
-    def _get_latest_spot_rates(self, merged_df):
-        # Sort both by the appropriate timestamp
+    def _get_latest_spot_rates(self, merged_df: pd.DataFrame) -> pd.DataFrame:
+        """Performs merge_asof to attach latest spot rate for each price timestamp."""
         merged_sorted = merged_df.sort_values('price_timestamp')
         spot_sorted = self.spot_rate_df.sort_values('spot_timestamp')
 
@@ -91,39 +105,23 @@ class PriceConverter():
         enriched.loc[cond_spot_out_of_window, 'remark'] = 'Spot rate too old (>1hr)'
 
         return enriched
-    
 
-    def export_to_csv(self, df: pd.DataFrame, filepath: str, index: bool = False) -> None:
-        """
-        Exports the given DataFrame to a CSV file.
-
-        Args:
-            df (pd.DataFrame): The DataFrame to export.
-            filepath (str): The full path to the output CSV file.
-            index (bool): Whether to include the index in the CSV file. Default is False.
-        """
-        try:
-            df.to_csv(filepath, index=index)
-            print(f"✅ File successfully saved to: {filepath}")
-        except Exception as e:
-            print(f"❌ Failed to export CSV: {e}")
-
-
-    def calculate_converted_prices(self):
-        # Step 1: Merge conversion info
+    def calculate_converted_prices(self) -> None:
+        """Executes the full conversion logic and stores the enriched result internally."""
+        print("  Step 1: Merging conversion factors...")
         merged_df = self._merge_conversion_factors()
 
-        # Step 2: Merge in latest spot rate
+        print("  Step 2: Attaching latest spot rates...")
         enriched = self._get_latest_spot_rates(merged_df)
 
-        # Step 3: Initialize remark and converted_price columns
+        print("  Step 3: Initializing columns...")
         enriched['remark'] = ''
-        enriched['converted_price'] = enriched['price']  # default
+        enriched['converted_price'] = enriched['price']
 
-        # Step 4: Flag issues
+        print("  Step 4: Flagging conversion issues...")
         enriched = self._flag_conversion_issues(enriched)
 
-        # Step 5: Perform valid conversion
+        print("  Step 5: Calculating valid converted prices...")
         time_diff = enriched['price_timestamp'] - enriched['spot_timestamp']
         cond_valid = (
             (enriched['remark'] == '') &
@@ -135,31 +133,55 @@ class PriceConverter():
 
         enriched.loc[cond_valid, 'converted_price'] = (
             enriched.loc[cond_valid, 'price'] / 
-            enriched.loc[cond_valid, 'conversion_factor']
-            + enriched.loc[cond_valid, 'spot_mid_rate']
+            enriched.loc[cond_valid, 'conversion_factor'] +
+            enriched.loc[cond_valid, 'spot_mid_rate']
         )
         enriched.loc[cond_valid, 'remark'] = 'Converted'
 
-        return enriched[[
+        self.result_df = enriched[[
             'price_timestamp', 'security_id', 'ccy_pair', 'price', 'conversion_factor',
             'spot_mid_rate', 'converted_price', 'convert_price', 'remark'
         ]]
     
+    def save_to_csv(self, output_path: str) -> None:
+        """Saves the computed result DataFrame to a CSV file."""
+        if self.result_df is None:
+            raise ValueError("No results to save. Run calculate_converted_prices() first.")
+        self.result_df.to_csv(output_path, index=False)
+        print(f"Result saved to: {output_path}")
+    
+def log_performance(converter: PriceConverter, output_path: str, start_time: float) -> None:
+    """Logs memory usage, time elapsed, and key metrics after conversion run."""
+    process = psutil.Process(os.getpid())
+    mem_used = process.memory_info().rss / 1e6
+    elapsed = time.time() - start_time
+    df = converter.result_df
+
+    print("\n=== PERFORMANCE REPORT ===")
+    print(f"  Time taken: {elapsed:.2f} seconds")
+    print(f"  Memory used: {mem_used:.2f} MB")
+    print(f"  Output path: {output_path}")
+    print(f"  Output exists: {os.path.exists(output_path)}")
+    print(f"  Output shape: {df.shape}")
+    print(f"  Empty remarks: {(df['remark'] == '').sum()}")
+    print(f"  Converted rows: {(df['remark'] == 'Converted').sum()}")
+    print("==========================\n")
+
 
 if __name__ == '__main__':
-    import pyarrow.parquet as pq
+    start_time = time.time()
 
-    rates_price_data_table = pq.read_table("Parameta/rates_test/data/rates_price_data.parq.gzip")
-    rates_spot_rate_data_table = pq.read_table("Parameta/rates_test/data/rates_spot_rate_data.parq.gzip")
+    print("Initializing PriceConverter...")
+    converter = PriceConverter(
+        price_path="Parameta/rates_test/data/rates_price_data.parq.gzip",
+        spot_path="Parameta/rates_test/data/rates_spot_rate_data.parq.gzip",
+        ccy_path="Parameta/rates_test/data/rates_ccy_data.csv"
+    )
 
-    rates_ccy_data_df = pd.read_csv("Parameta/rates_test/data/rates_ccy_data.csv")
+    print("Running conversion pipeline...")
+    converter.calculate_converted_prices()
 
-    rates_price_data_df = rates_price_data_table.to_pandas()
-    rates_spot_rate_data_df = rates_spot_rate_data_table.to_pandas()
+    output_csv = "Parameta/rates_test/results/converted_prices.csv"
+    converter.save_to_csv(output_csv)
 
-    converter = PriceConverter(rates_ccy_data_df, rates_price_data_df, rates_spot_rate_data_df)
-    result_df = converter.calculate_converted_prices()
-    print(result_df.head())
-    print(result_df[result_df["remark"] == ""])
-    
-    converter.export_to_csv(result_df, "Parameta/rates_test/results/converted_prices.csv")
+    log_performance(converter, output_csv, start_time)
