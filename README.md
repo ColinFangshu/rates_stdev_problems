@@ -13,8 +13,15 @@ Both problems arise from applications that generate hourly price snaps for a set
 
 2. **Rolling Standard Deviation**
    - Calculates rolling standard deviation for `bid`, `mid`, and `ask` columns.
-   - Only uses 20-hour windows with strictly contiguous 1-hour intervals.
+   - Only uses 20-hour windows with contiguous 1-hour intervals.
    - Ensures efficient processing and flags invalid snap gaps.
+
+## Updates (Rolling StdDev)
+- Use last 20 valid values before t (current row excluded).
+- Replaced pandas rolling+mask with single-pass deques (one per bid/mid/ask).
+- NaNs/gaps don’t reset the window; append only on next non-NaN.
+- Stable variance on window values; tiny stdevs → 0.0 (eps=1e-8).
+- Start-of-range (<20 valid prior) → stdev = NaN.
 
 ## 📁 Folder Structure
 
