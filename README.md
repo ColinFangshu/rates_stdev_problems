@@ -16,7 +16,7 @@ Both problems arise from applications that generate hourly price snaps for a set
    - Only uses 20-hour windows with contiguous 1-hour intervals.
    - Ensures efficient processing and flags invalid snap gaps.
 
-## Updates (Rolling StdDev)
+## ✨ Updates (Rolling StdDev)
 - Use last 20 valid values before t (current row excluded).
 - Replaced pandas rolling+mask with single-pass deques (one per bid/mid/ask).
 - NaNs/gaps don’t reset the window; append only on next non-NaN.
