@@ -1,7 +1,9 @@
 import pandas as pd
 import pyarrow.parquet as pq
-from typing import Optional, List
+from typing import Optional, List, Dict
 import numpy as np
+from collections import deque
+import math
 import time
 import os
 import psutil
@@ -9,7 +11,15 @@ import psutil
 
 class RollingPriceStdevCalculator:
     """
-    Calculates rolling standard deviation for bid, mid, ask prices per security ID based on 20 contiguous hourly snaps.
+    Rolling stdev for bid/mid/ask per security_id using the most recent block
+    of 20 contiguous hourly snaps strictly before each snap_time.
+
+    Rules implemented:
+      - Work on a complete hourly calendar per security in the [start, end] range.
+      - Missing snaps remain as rows (prices NaN), but we still compute stdev
+        at those times using the last contiguous 20 valid snaps that occurred earlier.
+      - A window never includes the current row's value.
+      - If < 20 contiguous valid values exist yet, result is NaN.
     """
     def __init__(self, file_path: str):
         """Initializes the calculator and loads data from a Parquet file."""
@@ -17,82 +27,95 @@ class RollingPriceStdevCalculator:
         self.price_df = pq.read_table(file_path).to_pandas()
         self.result_df = None
 
+    @staticmethod
+    def _hourly_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
+        return pd.date_range(start=start, end=end, freq="h")
+
     def _preprocess(self) -> None:
         """Converts timestamps and sorts the dataframe by security_id and snap_time."""
         self.price_df['snap_time'] = pd.to_datetime(self.price_df['snap_time'])
         self.price_df.sort_values(['security_id', 'snap_time'], inplace=True)
         self.price_df.reset_index(drop=True, inplace=True)
 
-    def _get_valid_window_indices(self, group_df: pd.DataFrame, window_size: int = 20) -> List[int]:
-        """Returns list of valid end indices where timestamps are contiguous for rolling window."""        
-        valid_end_indices = []
-        snap_times = group_df['snap_time'].reset_index(drop=True)
+    def _expand_to_full_grid(self, start, end) -> pd.DataFrame:
+        """Reindex each security_id to a full hourly calendar. Keeps original values; missing snaps become NaN rows."""
+        start_ts = pd.to_datetime(start)
+        end_ts = pd.to_datetime(end)
 
-        # Use vectorized diff
-        for i in range(len(group_df) - window_size + 1):
-            window = snap_times.iloc[i:i + window_size]
-            diffs = window.diff().dropna().dt.total_seconds()
-            if (diffs == 3600).all():
-                valid_end_indices.append(i + window_size - 1)
+        full_idx = self._hourly_index(start_ts, end_ts)
 
-        return valid_end_indices
+        out = []
+        for sec_id, g in self.price_df.groupby('security_id', sort=False):
+            g = g.set_index('snap_time').sort_index() # assume snap_time contains no duplicates 
+            g = g.reindex(full_idx)  # adds missing hours
+            g['security_id'] = sec_id
+            g.index.name = 'snap_time'
+            g.reset_index(inplace=True)
+            out.append(g)
 
-    def _calculate_group_stdevs(self, group_df: pd.DataFrame, window_size: int = 20) -> pd.DataFrame:
+        return pd.concat(out, ignore_index=True)
+
+    @staticmethod
+    def _rolling_stdev_with_deques(group_df, cols, window=20, eps=1e-8) -> pd.DataFrame: 
         """
-        Calculates rolling standard deviation for bid, mid, and ask over a specified window size.
-
-        The function performs a fresh calculation for each group without relying on any previous intermediate results.
-        It computes the full rolling standard deviation first, then masks out rows where the preceding timestamps are
-        not strictly contiguous (i.e., 19 consecutive 1-hour gaps). This ensures only valid 20-hour windows are retained.
+        Single pass over time for one security_id.
+        For each column, maintain a deque of the most recent contiguous valid values.
+        Compute stdev at time t using the deque before considering row t's value.
         """
-        group_df = group_df.copy().reset_index(drop=True)
+        n = len(group_df)
+        times = group_df['snap_time'].to_numpy()
+        outputs = {f"{c}_stdev": np.full(n, np.nan, dtype=float) for c in cols}
 
-        # Step 1: Compute time_diff in seconds
-        group_df['time_diff'] = group_df['snap_time'].diff().dt.total_seconds()
+        dq = {c: deque() for c in cols}
+        vals = {c: group_df[c].to_numpy() for c in cols}
 
-        # Step 2: Use rolling to check if last 19 time_diff values == 3600 (i.e., 1-hour gaps)
-        is_contiguous = (
-            group_df['time_diff']
-            .rolling(window=window_size - 1)
-            .apply(lambda x: np.all(x == 3600), raw=True)
-            .shift(1)  # align with current row
-        )
+        for i in range(n):
+            t = times[i]
+            # 1) compute outputs from the current deque (exclude row i)
+            for c in cols:
+                if len(dq[c]) >= window:
+                    arr = np.array(dq[c], dtype=np.float64)
+                    mu = arr.mean()
+                    var = ((arr - mu) ** 2).mean()
+                    stdev = math.sqrt(var)
+                    outputs[f"{c}_stdev"][i] = 0.0 if stdev < eps else stdev # zero out tiny results
+            
+            # 2) update deques using *current* row (for next timestamp's compute)
+            for c in cols:
+                v = vals[c][i]
+                if not np.isnan(v):
+                    dq[c].append(v)
+                    if len(dq[c]) > window:
+                        dq[c].popleft()
 
-        # Step 3: Apply rolling std
-        group_df['bid_stdev'] = group_df['bid'].rolling(window=window_size).std(ddof=0)
-        group_df['mid_stdev'] = group_df['mid'].rolling(window=window_size).std(ddof=0)
-        group_df['ask_stdev'] = group_df['ask'].rolling(window=window_size).std(ddof=0)
+        out_df = group_df[['security_id', 'snap_time']].copy()
+        for name, arr in outputs.items():
+            out_df[name] = arr
+        return out_df
 
-        # Step 4: Invalidate stdevs where window isn't contiguous
-        invalid_mask = is_contiguous != 1.0
-        group_df.loc[invalid_mask, ['bid_stdev', 'mid_stdev', 'ask_stdev']] = np.nan
-
-        # Optional cleanup
-        group_df.drop(columns='time_diff', inplace=True)
-
-        return group_df
-
-    def compute_all(self, start: Optional[str] = None, end: Optional[str] = None, window_size: int = 20) -> None:
-        """Runs the full rolling stdev calculation for all security IDs."""
-        print("Preprocessing data...")
+    def compute_all(self, start, end, window_size = 20) -> None:
+        """
+        Full pipeline:
+          1) preprocess raw dataframe
+          2) build complete hourly grid per security_id in [start, end]
+          3) per security, compute stdev for bid/mid/ask with deques
+        """
         self._preprocess()
+        print("Building hourly calendar and filling gaps...")
+        full = self._expand_to_full_grid(start, end)
 
-        result = []
-        print("Processing security_id groups...")
-        for sec_id, group_df in self.price_df.groupby('security_id'):
-            calculated = self._calculate_group_stdevs(group_df, window_size)
-            result.append(calculated)
+        print("Computing rolling stdevs with contiguous windows (deque)...")
+        results = []
+        for sec_id, g in full.groupby('security_id', sort=False):
+            g = g.sort_values('snap_time').reset_index(drop=True)
+            out = self._rolling_stdev_with_deques(
+                g, cols=['bid', 'mid', 'ask'], window=window_size
+            )
+            results.append(
+                g.merge(out, on=['security_id', 'snap_time'], how='left')
+            )
 
-        all_df = pd.concat(result, ignore_index=True)
-
-        if start and end:
-            all_df = all_df[
-                (all_df['snap_time'] >= pd.to_datetime(start)) &
-                (all_df['snap_time'] <= pd.to_datetime(end))
-            ]
-
-        self.result_df = all_df
-        print("Rolling standard deviation calculation complete.")
+        self.result_df = pd.concat(results, ignore_index=True)
 
     def save_to_csv(self, output_path: str) -> None:
         """Saves the result DataFrame to a CSV file."""
@@ -137,5 +160,4 @@ if __name__ == '__main__':
     price_stdev_calculator.save_to_csv(output_csv)
 
     log_performance(price_stdev_calculator, output_csv, start_time)
-
     print("Done.")
